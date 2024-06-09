@@ -57,7 +57,7 @@ from khoj.utils.helpers import (
     get_device,
     is_none_or_empty,
 )
-from khoj.utils.rawconfig import LocationData
+from khoj.utils.rawconfig import FilterRequest, LocationData
 
 # Initialize Router
 logger = logging.getLogger(__name__)
@@ -71,6 +71,57 @@ api_chat = APIRouter()
 from pydantic import BaseModel
 
 from khoj.routers.email import send_query_feedback
+
+
+@api_chat.get("/conversation/file-filters/{conversation_id}", response_class=Response)
+@requires(["authenticated"])
+def get_file_filter(request: Request, conversation_id: str) -> Response:
+    conversation = ConversationAdapters.get_conversation_by_user(
+        request.user.object, conversation_id=int(conversation_id)
+    )
+    # get all files from "computer"
+    file_list = EntryAdapters.get_all_filenames_by_source(request.user.object, "computer")
+    file_filters = []
+    for file in conversation.file_filters:
+        if file in file_list:
+            file_filters.append(file)
+    return Response(content=json.dumps(file_filters), media_type="application/json", status_code=200)
+
+
+@api_chat.post("/conversation/file-filters", response_class=Response)
+@requires(["authenticated"])
+def add_file_filter(request: Request, filter: FilterRequest):
+    try:
+        conversation = ConversationAdapters.get_conversation_by_user(
+            request.user.object, conversation_id=int(filter.conversation_id)
+        )
+        file_list = EntryAdapters.get_all_filenames_by_source(request.user.object, "computer")
+        if filter.filename in file_list and filter.filename not in conversation.file_filters:
+            conversation.file_filters.append(filter.filename)
+            conversation.save()
+        # remove files from conversation.file_filters that are not in file_list
+        conversation.file_filters = [file for file in conversation.file_filters if file in file_list]
+        conversation.save()
+        return Response(content=json.dumps(conversation.file_filters), media_type="application/json", status_code=200)
+    except Exception as e:
+        logger.error(f"Error adding file filter {filter.filename}: {e}", exc_info=True)
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@api_chat.delete("/conversation/file-filters", response_class=Response)
+@requires(["authenticated"])
+def remove_file_filter(request: Request, filter: FilterRequest) -> Response:
+    conversation = ConversationAdapters.get_conversation_by_user(
+        request.user.object, conversation_id=int(filter.conversation_id)
+    )
+    if filter.filename in conversation.file_filters:
+        conversation.file_filters.remove(filter.filename)
+    conversation.save()
+    # remove files from conversation.file_filters that are not in file_list
+    file_list = EntryAdapters.get_all_filenames_by_source(request.user.object, "computer")
+    conversation.file_filters = [file for file in conversation.file_filters if file in file_list]
+    conversation.save()
+    return Response(content=json.dumps(conversation.file_filters), media_type="application/json", status_code=200)
 
 
 class FeedbackData(BaseModel):
@@ -487,6 +538,10 @@ async def websocket_endpoint(
             if conversation:
                 await sync_to_async(conversation.refresh_from_db)(fields=["conversation_log"])
             q = await websocket.receive_text()
+
+            # Refresh these because the connection to the database might have been closed
+            await conversation.arefresh_from_db()
+
         except WebSocketDisconnect:
             logger.debug(f"User {user} disconnected web socket")
             break
@@ -511,15 +566,6 @@ async def websocket_endpoint(
 
         await send_status_update(f"**👀 Understanding Query**: {q}")
 
-        if conversation_commands == [ConversationCommand.Help]:
-            conversation_config = await ConversationAdapters.aget_user_conversation_config(user)
-            if conversation_config == None:
-                conversation_config = await ConversationAdapters.aget_default_conversation_config()
-            model_type = conversation_config.model_type
-            formatted_help = help_message.format(model=model_type, version=state.khoj_version, device=get_device())
-            await send_complete_llm_response(formatted_help)
-            continue
-
         meta_log = conversation.conversation_log
         is_automated_task = conversation_commands == [ConversationCommand.AutomatedTask]
 
@@ -536,6 +582,20 @@ async def websocket_endpoint(
         for cmd in conversation_commands:
             await conversation_command_rate_limiter.update_and_check_if_valid(websocket, cmd)
             q = q.replace(f"/{cmd.value}", "").strip()
+
+        custom_filters = []
+        if conversation_commands == [ConversationCommand.Help]:
+            if not q:
+                conversation_config = await ConversationAdapters.aget_user_conversation_config(user)
+                if conversation_config == None:
+                    conversation_config = await ConversationAdapters.aget_default_conversation_config()
+                model_type = conversation_config.model_type
+                formatted_help = help_message.format(model=model_type, version=state.khoj_version, device=get_device())
+                await send_complete_llm_response(formatted_help)
+                continue
+            # Adding specification to search online specifically on khoj.dev pages.
+            custom_filters.append("site:khoj.dev")
+            conversation_commands.append(ConversationCommand.Online)
 
         if ConversationCommand.Automation in conversation_commands:
             try:
@@ -577,13 +637,11 @@ async def websocket_endpoint(
             continue
 
         compiled_references, inferred_queries, defiltered_query = await extract_references_and_questions(
-            websocket, meta_log, q, 7, 0.18, conversation_commands, location, send_status_update
+            websocket, meta_log, q, 7, 0.18, conversation_id, conversation_commands, location, send_status_update
         )
 
         if compiled_references:
-            headings = "\n- " + "\n- ".join(
-                set([" ".join(c.split("Path: ")[1:]).split("\n ")[0] for c in compiled_references])
-            )
+            headings = "\n- " + "\n- ".join(set([c.get("compiled", c).split("\n")[0] for c in compiled_references]))
             await send_status_update(f"**📜 Found Relevant Notes**: {headings}")
 
         online_results: Dict = dict()
@@ -603,7 +661,9 @@ async def websocket_endpoint(
                     conversation_commands.append(ConversationCommand.Webpage)
             else:
                 try:
-                    online_results = await search_online(defiltered_query, meta_log, location, send_status_update)
+                    online_results = await search_online(
+                        defiltered_query, meta_log, location, send_status_update, custom_filters
+                    )
                 except ValueError as e:
                     logger.warning(f"Error searching online: {e}. Attempting to respond without online results")
                     await send_complete_llm_response(
@@ -613,11 +673,17 @@ async def websocket_endpoint(
 
         if ConversationCommand.Webpage in conversation_commands:
             try:
-                online_results = await read_webpages(defiltered_query, meta_log, location, send_status_update)
+                direct_web_pages = await read_webpages(defiltered_query, meta_log, location, send_status_update)
                 webpages = []
-                for query in online_results:
-                    for webpage in online_results[query]["webpages"]:
+                for query in direct_web_pages:
+                    if online_results.get(query):
+                        online_results[query]["webpages"] = direct_web_pages[query]["webpages"]
+                    else:
+                        online_results[query] = {"webpages": direct_web_pages[query]["webpages"]}
+
+                    for webpage in direct_web_pages[query]["webpages"]:
                         webpages.append(webpage["link"])
+
                 await send_status_update(f"**📚 Read web pages**: {webpages}")
             except ValueError as e:
                 logger.warning(
@@ -745,13 +811,19 @@ async def chat(
     await is_ready_to_chat(user)
     conversation_commands = [get_conversation_command(query=q, any_references=True)]
 
+    _custom_filters = []
     if conversation_commands == [ConversationCommand.Help]:
-        conversation_config = await ConversationAdapters.aget_user_conversation_config(user)
-        if conversation_config == None:
-            conversation_config = await ConversationAdapters.aget_default_conversation_config()
-        model_type = conversation_config.model_type
-        formatted_help = help_message.format(model=model_type, version=state.khoj_version, device=get_device())
-        return StreamingResponse(iter([formatted_help]), media_type="text/event-stream", status_code=200)
+        help_str = "/" + ConversationCommand.Help
+        if q.strip() == help_str:
+            conversation_config = await ConversationAdapters.aget_user_conversation_config(user)
+            if conversation_config == None:
+                conversation_config = await ConversationAdapters.aget_default_conversation_config()
+            model_type = conversation_config.model_type
+            formatted_help = help_message.format(model=model_type, version=state.khoj_version, device=get_device())
+            return StreamingResponse(iter([formatted_help]), media_type="text/event-stream", status_code=200)
+        # Adding specification to search online specifically on khoj.dev pages.
+        _custom_filters.append("site:khoj.dev")
+        conversation_commands.append(ConversationCommand.Online)
 
     conversation = await ConversationAdapters.aget_conversation_by_user(
         user, request.user.client_app, conversation_id, title
@@ -815,7 +887,7 @@ async def chat(
             return Response(content=llm_response, media_type="text/plain", status_code=200)
 
     compiled_references, inferred_queries, defiltered_query = await extract_references_and_questions(
-        request, meta_log, q, (n or 5), (d or math.inf), conversation_commands, location
+        request, meta_log, q, (n or 5), (d or math.inf), conversation_id, conversation_commands, location
     )
     online_results: Dict[str, Dict] = {}
 
@@ -846,7 +918,9 @@ async def chat(
                 conversation_commands.append(ConversationCommand.Webpage)
         else:
             try:
-                online_results = await search_online(defiltered_query, meta_log, location)
+                online_results = await search_online(
+                    defiltered_query, meta_log, location, custom_filters=_custom_filters
+                )
             except ValueError as e:
                 logger.warning(f"Error searching online: {e}. Attempting to respond without online results")
 
@@ -934,6 +1008,11 @@ async def chat(
 
     actual_response = aggregated_gpt_response.split("### compiled references:")[0]
 
-    response_obj = {"response": actual_response, "context": compiled_references}
+    response_obj = {
+        "response": actual_response,
+        "inferredQueries": inferred_queries,
+        "context": compiled_references,
+        "online_results": online_results,
+    }
 
     return Response(content=json.dumps(response_obj), media_type="application/json", status_code=200)

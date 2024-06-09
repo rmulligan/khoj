@@ -3,8 +3,10 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
+from random import random
 from typing import Any, Callable, List, Optional, Union
 
 import cron_descriptor
@@ -26,6 +28,9 @@ from khoj.database.adapters import (
     get_user_search_model_or_default,
 )
 from khoj.database.models import ChatModelOptions, KhojUser, SpeechToTextModelOptions
+from khoj.processor.conversation.anthropic.anthropic_chat import (
+    extract_questions_anthropic,
+)
 from khoj.processor.conversation.offline.chat_model import extract_questions_offline
 from khoj.processor.conversation.offline.whisper import transcribe_audio_offline
 from khoj.processor.conversation.openai.gpt import extract_questions
@@ -278,6 +283,7 @@ async def extract_references_and_questions(
     q: str,
     n: int,
     d: float,
+    conversation_id: int,
     conversation_commands: List[ConversationCommand] = [ConversationCommand.Default],
     location_data: LocationData = None,
     send_status_func: Optional[Callable] = None,
@@ -303,8 +309,15 @@ async def extract_references_and_questions(
     for filter in [DateFilter(), WordFilter(), FileFilter()]:
         defiltered_query = filter.defilter(defiltered_query)
     filters_in_query = q.replace(defiltered_query, "").strip()
+    conversation = await sync_to_async(ConversationAdapters.get_conversation_by_id)(conversation_id)
 
+    if not conversation:
+        logger.error(f"Conversation with id {conversation_id} not found.")
+        return compiled_references, inferred_queries, defiltered_query
+
+    filters_in_query += " ".join([f'file:"{filter}"' for filter in conversation.file_filters])
     using_offline_chat = False
+    print(f"Filters in query: {filters_in_query}")
 
     # Infer search queries from user message
     with timer("Extracting search queries took", logger):
@@ -338,18 +351,29 @@ async def extract_references_and_questions(
                 api_key=api_key,
                 conversation_log=meta_log,
                 location_data=location_data,
+                max_tokens=conversation_config.max_prompt_size,
+            )
+        elif conversation_config.model_type == ChatModelOptions.ModelType.ANTHROPIC:
+            api_key = conversation_config.openai_config.api_key
+            chat_model = conversation_config.chat_model
+            inferred_queries = extract_questions_anthropic(
+                defiltered_query,
+                model=chat_model,
+                api_key=api_key,
+                conversation_log=meta_log,
+                location_data=location_data,
             )
 
     # Collate search results as context for GPT
     with timer("Searching knowledge base took", logger):
-        result_list = []
+        search_results = []
         logger.info(f"🔍 Searching knowledge base with queries: {inferred_queries}")
         if send_status_func:
             inferred_queries_str = "\n- " + "\n- ".join(inferred_queries)
             await send_status_func(f"**🔍 Searching Documents for:** {inferred_queries_str}")
         for query in inferred_queries:
             n_items = min(n, 3) if using_offline_chat else n
-            result_list.extend(
+            search_results.extend(
                 await execute_search(
                     user,
                     f"{query} {filters_in_query}",
@@ -360,8 +384,10 @@ async def extract_references_and_questions(
                     dedupe=False,
                 )
             )
-        result_list = text_search.deduplicated_search_responses(result_list)
-        compiled_references = [item.additional["compiled"] for item in result_list]
+        search_results = text_search.deduplicated_search_responses(search_results)
+        compiled_references = [
+            {"compiled": item.additional["compiled"], "file": item.additional["file"]} for item in search_results
+        ]
 
     return compiled_references, inferred_queries, defiltered_query
 
@@ -427,6 +453,7 @@ async def post_automation(
     request: Request,
     q: str,
     crontime: str,
+    subject: Optional[str] = None,
     city: Optional[str] = None,
     region: Optional[str] = None,
     country: Optional[str] = None,
@@ -445,19 +472,36 @@ async def post_automation(
     q = q.strip()
     if not q.startswith("/automated_task"):
         query_to_run = f"/automated_task {q}"
+
     # Normalize crontime for AP Scheduler CronTrigger
     crontime = crontime.strip()
     if len(crontime.split(" ")) > 5:
         # Truncate crontime to 5 fields
         crontime = " ".join(crontime.split(" ")[:5])
+
     # Convert crontime to standard unix crontime
     crontime = crontime.replace("?", "*")
-    subject = await acreate_title_from_query(q)
+
+    # Disallow minute level automation recurrence
+    minute_value = crontime.split(" ")[0]
+    if not minute_value.isdigit():
+        return Response(
+            content="Recurrence of every X minutes is unsupported. Please create a less frequent schedule.",
+            status_code=400,
+        )
+
+    if not subject:
+        subject = await acreate_title_from_query(q)
+
+    # Create new Conversation Session associated with this new task
+    conversation = await ConversationAdapters.acreate_conversation_session(user, request.user.client_app)
+
+    calling_url = request.url.replace(query=f"{request.url.query}&conversation_id={conversation.id}")
 
     # Schedule automation with query_to_run, timezone, subject directly provided by user
     try:
         # Use the query to run as the scheduling request if the scheduling request is unset
-        automation = await schedule_automation(query_to_run, subject, crontime, timezone, q, user, request.url)
+        automation = await schedule_automation(query_to_run, subject, crontime, timezone, q, user, calling_url)
     except Exception as e:
         logger.error(f"Error creating automation {q} for {user.email}: {e}", exc_info=True)
         return Response(
@@ -471,6 +515,31 @@ async def post_automation(
 
     # Return information about the created automation as a JSON response
     return Response(content=json.dumps(automation_info), media_type="application/json", status_code=200)
+
+
+@api.post("/trigger/automation", response_class=Response)
+@requires(["authenticated"])
+def trigger_manual_job(
+    request: Request,
+    automation_id: str,
+):
+    user: KhojUser = request.user.object
+
+    # Check, get automation to edit
+    try:
+        automation: Job = AutomationAdapters.get_automation(user, automation_id)
+    except ValueError as e:
+        logger.error(f"Error triggering automation {automation_id} for {user.email}: {e}", exc_info=True)
+        return Response(content="Invalid automation", status_code=403)
+
+    # Trigger the job without waiting for the result.
+    scheduled_chat_func = automation.func
+
+    # Run the function in a separate thread
+    thread = threading.Thread(target=scheduled_chat_func, args=automation.args, kwargs=automation.kwargs)
+    thread.start()
+
+    return Response(content="Automation triggered", status_code=200)
 
 
 @api.put("/automation", response_class=Response)
@@ -512,6 +581,14 @@ def edit_job(
         crontime = " ".join(crontime.split(" ")[:5])
     # Convert crontime to standard unix crontime
     crontime = crontime.replace("?", "*")
+
+    # Disallow minute level automation recurrence
+    minute_value = crontime.split(" ")[0]
+    if not minute_value.isdigit():
+        return Response(
+            content="Recurrence of every X minutes is unsupported. Please create a less frequent schedule.",
+            status_code=400,
+        )
 
     # Construct updated automation metadata
     automation_metadata = json.loads(automation.name)

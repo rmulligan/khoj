@@ -108,8 +108,7 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = "app.wsgi.application"
-
+ASGI_APPLICATION = "app.asgi.application"
 
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
@@ -122,6 +121,7 @@ DATABASES = {
         "USER": os.getenv("POSTGRES_USER", "postgres"),
         "NAME": os.getenv("POSTGRES_DB", "khoj"),
         "PASSWORD": os.getenv("POSTGRES_PASSWORD", "postgres"),
+        "CONN_MAX_AGE": 0,
     }
 }
 

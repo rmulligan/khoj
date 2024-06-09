@@ -84,6 +84,7 @@ class ChatModelOptions(BaseModel):
     class ModelType(models.TextChoices):
         OPENAI = "openai"
         OFFLINE = "offline"
+        ANTHROPIC = "anthropic"
 
     max_prompt_size = models.IntegerField(default=None, null=True, blank=True)
     tokenizer = models.CharField(max_length=200, default=None, null=True, blank=True)
@@ -156,6 +157,15 @@ class GithubRepoConfig(BaseModel):
     owner = models.CharField(max_length=200)
     branch = models.CharField(max_length=200)
     github_config = models.ForeignKey(GithubConfig, on_delete=models.CASCADE, related_name="githubrepoconfig")
+
+
+class ServerChatSettings(BaseModel):
+    default_model = models.ForeignKey(
+        ChatModelOptions, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="default_model"
+    )
+    summarizer_model = models.ForeignKey(
+        ChatModelOptions, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="summarizer_model"
+    )
 
 
 class LocalOrgConfig(BaseModel):
@@ -248,6 +258,7 @@ class Conversation(BaseModel):
     slug = models.CharField(max_length=200, default=None, null=True, blank=True)
     title = models.CharField(max_length=200, default=None, null=True, blank=True)
     agent = models.ForeignKey(Agent, on_delete=models.SET_NULL, default=None, null=True, blank=True)
+    file_filters = models.JSONField(default=list)
 
 
 class PublicConversation(BaseModel):

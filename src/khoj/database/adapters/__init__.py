@@ -39,6 +39,7 @@ from khoj.database.models import (
     PublicConversation,
     ReflectiveQuestion,
     SearchModelConfig,
+    ServerChatSettings,
     SpeechToTextModelOptions,
     Subscription,
     TextToImageModelConfig,
@@ -446,7 +447,7 @@ class ProcessLockAdapters:
     def run_with_lock(func: Callable, operation: ProcessLock.Operation, max_duration_in_seconds: int = 600, **kwargs):
         # Exit early if process lock is already taken
         if ProcessLockAdapters.is_process_locked(operation):
-            logger.info(f"🔒 Skip executing {func} as {operation} lock is already taken")
+            logger.debug(f"🔒 Skip executing {func} as {operation} lock is already taken")
             return
 
         success = False
@@ -461,7 +462,7 @@ class ProcessLockAdapters:
                 func(**kwargs)
             success = True
         except IntegrityError as e:
-            logger.error(f"⚠️ Unable to create the process lock for {func} with {operation}: {e}")
+            logger.debug(f"⚠️ Unable to create the process lock for {func} with {operation}: {e}")
             success = False
         except Exception as e:
             logger.error(f"🚨 Error executing {func} with {operation} process lock: {e}", exc_info=True)
@@ -474,7 +475,7 @@ class ProcessLockAdapters:
                     f"🔓 Unlocked {operation} process after executing {func} {'Succeeded' if success else 'Failed'}"
                 )
             else:
-                logger.info(f"Skip removing {operation} process lock as it was not set")
+                logger.debug(f"Skip removing {operation} process lock as it was not set")
 
 
 def run_with_process_lock(*args, **kwargs):
@@ -492,7 +493,7 @@ class ClientApplicationAdapters:
 
 class AgentAdapters:
     DEFAULT_AGENT_NAME = "Khoj"
-    DEFAULT_AGENT_AVATAR = "https://khoj-web-bucket.s3.amazonaws.com/lamp-128.png"
+    DEFAULT_AGENT_AVATAR = "https://assets.khoj.dev/lamp-128.png"
     DEFAULT_AGENT_SLUG = "khoj"
 
     @staticmethod
@@ -702,11 +703,36 @@ class ConversationAdapters:
 
     @staticmethod
     def get_default_conversation_config():
-        return ChatModelOptions.objects.filter().first()
+        server_chat_settings = ServerChatSettings.objects.first()
+        if server_chat_settings is None or server_chat_settings.default_model is None:
+            return ChatModelOptions.objects.filter().first()
+        return server_chat_settings.default_model
 
     @staticmethod
     async def aget_default_conversation_config():
-        return await ChatModelOptions.objects.filter().prefetch_related("openai_config").afirst()
+        server_chat_settings: ServerChatSettings = (
+            await ServerChatSettings.objects.filter()
+            .prefetch_related("default_model", "default_model__openai_config")
+            .afirst()
+        )
+        if server_chat_settings is None or server_chat_settings.default_model is None:
+            return await ChatModelOptions.objects.filter().prefetch_related("openai_config").afirst()
+        return server_chat_settings.default_model
+
+    @staticmethod
+    async def aget_summarizer_conversation_config():
+        server_chat_settings: ServerChatSettings = (
+            await ServerChatSettings.objects.filter()
+            .prefetch_related(
+                "summarizer_model", "default_model", "default_model__openai_config", "summarizer_model__openai_config"
+            )
+            .afirst()
+        )
+        if server_chat_settings is None or (
+            server_chat_settings.summarizer_model is None and server_chat_settings.default_model is None
+        ):
+            return await ChatModelOptions.objects.filter().afirst()
+        return server_chat_settings.summarizer_model or server_chat_settings.default_model
 
     @staticmethod
     def create_conversation_from_public_conversation(
@@ -807,7 +833,9 @@ class ConversationAdapters:
 
             return conversation_config
 
-        if conversation_config.model_type == "openai" and conversation_config.openai_config:
+        if (
+            conversation_config.model_type == "openai" or conversation_config.model_type == "anthropic"
+        ) and conversation_config.openai_config:
             return conversation_config
 
         else:

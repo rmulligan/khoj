@@ -6,7 +6,7 @@
 ;;         Saba Imran <saba@khoj.dev>
 ;; Description: An AI copilot for your Second Brain
 ;; Keywords: search, chat, org-mode, outlines, markdown, pdf, image
-;; Version: 1.12.0
+;; Version: 1.13.0
 ;; Package-Requires: ((emacs "27.1") (transient "0.3.0") (dash "2.19.1"))
 ;; URL: https://github.com/khoj-ai/khoj/tree/master/src/interface/emacs
 
@@ -108,13 +108,18 @@
   :group 'khoj
   :type 'number)
 
+(defcustom khoj-index-files-batch 30
+  "Number of files to send for indexing in each request."
+  :group 'khoj
+  :type 'number)
+
 (defcustom khoj-default-content-type "org"
   "The default content type to perform search on."
   :group 'khoj
   :type '(choice (const "org")
-                 (const "markdown")
-                 (const "image")
-                 (const "pdf")))
+          (const "markdown")
+          (const "image")
+          (const "pdf")))
 
 
 ;; --------------------------
@@ -149,7 +154,7 @@
 (declare-function org-element-type "org-mode" (ELEMENT))
 (declare-function markdown-mode "markdown-mode" ())
 (declare-function which-key--show-keymap "which-key" (KEYMAP-NAME KEYMAP &optional PRIOR-ARGS ALL
-NO-PAGING FILTER))
+                                                                  NO-PAGING FILTER))
 
 (defun khoj--keybindings-info-message ()
   "Show available khoj keybindings in-context, when khoj invoked."
@@ -233,10 +238,10 @@ Khoj will try to use the system interpreter if it exists. If you wish
 to use a specific python interpreter (from a virtual environment
 for example), set this to the full interpreter path."
   :type '(choice (const :tag "python" "python")
-                 (const :tag "python3" "python3")
-                 (const :tag "pythonw (Python on Windows)" "pythonw")
-                 (const :tag "py (other Python on Windows)" "py")
-                 (string :tag "Other"))
+          (const :tag "python3" "python3")
+          (const :tag "pythonw (Python on Windows)" "pythonw")
+          (const :tag "py (other Python on Windows)" "py")
+          (string :tag "Other"))
   :safe (lambda (val)
           (member val '("python" "python3" "pythonw" "py")))
   :group 'khoj)
@@ -338,7 +343,7 @@ Auto invokes setup steps on calling main entrypoint."
                      (internal-default-process-filter process msg))))
     (set-process-query-on-exit-flag khoj--server-process nil)
     (when (not khoj--server-process)
-        (message "khoj.el: Failed to start Khoj server. Please start it manually by running `khoj' on terminal.\n%s" (buffer-string)))))
+      (message "khoj.el: Failed to start Khoj server. Please start it manually by running `khoj' on terminal.\n%s" (buffer-string)))))
 
 (defun khoj--server-started? ()
   "Check if the khoj server has been started."
@@ -375,7 +380,7 @@ Auto invokes setup steps on calling main entrypoint."
   (when (and khoj-server-is-local
              (or (not (executable-find khoj-server-command))
                  (not (khoj--server-get-version))))
-      (khoj--server-install-upgrade))
+    (khoj--server-install-upgrade))
   ;; Start khoj server if not already started
   (when (not (khoj--server-started?))
     (khoj--server-start)))
@@ -390,7 +395,7 @@ Auto invokes setup steps on calling main entrypoint."
                       t)))
     ;; If user permits setup of khoj server from khoj.el
     (when permitted
-      ; Install, start server if server not running
+                                        ; Install, start server if server not running
       (when not-started
         (khoj--server-setup))
 
@@ -416,65 +421,40 @@ Auto invokes setup steps on calling main entrypoint."
          (files-to-index (or file-paths
                              (append (mapcan (lambda (dir) (directory-files-recursively dir "\\.\\(org\\|md\\|markdown\\|pdf\\|txt\\|rst\\|xml\\|htm\\|html\\)$")) content-directories) content-files)))
          (type-query (if (or (equal content-type "all") (not content-type)) "" (format "t=%s" content-type)))
-         (delete-files (khoj--get-delete-file-list khoj--indexed-files files-to-index))
+         (delete-files (-difference khoj--indexed-files files-to-index))
          (inhibit-message t)
          (message-log-max nil)
-         (batch-size 2))
-	(dolist (files (khoj--split-file-list files-to-index batch-size))
+         (batch-size khoj-index-files-batch))
+    (dolist (files (-partition-all batch-size files-to-index))
       (khoj--send-index-update-request (khoj--render-update-files-as-request-body files boundary) boundary content-type type-query force))
     (when delete-files
-        (khoj--send-index-update-request (khoj--render-delete-files-as-request-body delete-files boundary) boundary content-type type-query force))
+      (khoj--send-index-update-request (khoj--render-delete-files-as-request-body delete-files boundary) boundary content-type type-query force))
     (setq khoj--indexed-files files-to-index)))
 
-(defun khoj--get-delete-file-list (indexed-files upload-files)
-  "Get delete file list. when `INDEXED-FILES' no longer in `UPLOAD-FILES'.
-delete them. return delete-file-list."
-  (let (delete-files '())
-    (dolist (indexed-file indexed-files)
-      (when (not (member indexed-file upload-files))
-        (push indexed-file delete-files)))
-    delete-files))
-
-(defun khoj--split-file-list (file-list size)
-  "Split `FILE-LIST' into subgroups of `SIZE' files each."
-  (let ((subgroups '())
-        (current-group '()))
-    (dolist (file file-list)
-      (if (= (length current-group) size)
-          ;; If the current group has size files, start a new group
-          (progn
-            (push current-group subgroups)
-            (setq current-group '()))
-        (push file current-group)))
-    ;; Add the last group if it's not empty
-    (when current-group
-      (push (nreverse current-group) subgroups))
-    (nreverse subgroups)))  ; Reverse to maintain the original order of file-list
-
 (defun khoj--send-index-update-request (body boundary &optional content-type type-query force)
-  "Send `BODY' request to khoj server. 'TYPE-QUERY' is appended to the URL.
-Use `BOUNDARY' to add headder conte
-nt-type."
+  "Send multi-part form `BODY' of `CONTENT-TYPE' in request to khoj server.
+Append 'TYPE-QUERY' as query parameter in request url.
+Specify `BOUNDARY' used to separate files in request header."
   (let ((url-request-method "POST")
         (url-request-data body)
-          (url-request-extra-headers `(("content-type" . ,(format "multipart/form-data; boundary=%s" boundary))
-                                       ("Authorization" . ,(format "Bearer %s" khoj-api-key)))))
-      (with-current-buffer
-          (url-retrieve (format "%s/api/v1/index/update?%s&force=%s&client=emacs" khoj-server-url type-query (or force "false"))
-                        ;; render response from indexing API endpoint on server
-                        (lambda (status)
-                          (if (not (plist-get status :error))
-                              (message "khoj.el: %scontent index %supdated" (if content-type (format "%s " content-type) "all ") (if force "force " ""))
-                            (progn
-                              (khoj--delete-open-network-connections-to-server)
-                              (with-current-buffer (current-buffer)
-                                (search-forward "\n\n" nil t)
-                                (message "khoj.el: Failed to %supdate %scontent index. Status: %s%s"
-                                         (if force "force " "")
-                                         (if content-type (format "%s " content-type) "all")
-                                         (string-trim (format "%s %s" (nth 1 (nth 1 status)) (nth 2 (nth 1 status))))
-                                         (if (> (- (point-max) (point)) 0) (format ". Response: %s" (string-trim (buffer-substring-no-properties (point) (point-max)))) ""))))))
-                        nil t t))))
+        (url-request-extra-headers `(("content-type" . ,(format "multipart/form-data; boundary=%s" boundary))
+                                     ("Authorization" . ,(format "Bearer %s" khoj-api-key)))))
+    (with-current-buffer
+        (url-retrieve (format "%s/api/v1/index/update?%s&force=%s&client=emacs" khoj-server-url type-query (or force "false"))
+                      ;; render response from indexing API endpoint on server
+                      (lambda (status)
+                        (if (not (plist-get status :error))
+                            (message "khoj.el: %scontent index %supdated" (if content-type (format "%s " content-type) "all ") (if force "force " ""))
+                          (progn
+                            (khoj--delete-open-network-connections-to-server)
+                            (with-current-buffer (current-buffer)
+                              (search-forward "\n\n" nil t)
+                              (message "khoj.el: Failed to %supdate %scontent index. Status: %s%s"
+                                       (if force "force " "")
+                                       (if content-type (format "%s " content-type) "all")
+                                       (string-trim (format "%s %s" (nth 1 (nth 1 status)) (nth 2 (nth 1 status))))
+                                       (if (> (- (point-max) (point)) 0) (format ". Response: %s" (string-trim (buffer-substring-no-properties (point) (point-max)))) ""))))))
+                      nil t t))))
 
 (defun khoj--render-update-files-as-request-body (files-to-index boundary)
   "Render `FILES-TO-INDEX', `PREVIOUSLY-INDEXED-FILES' as multi-part form body.
@@ -486,13 +466,13 @@ Use `BOUNDARY' to separate files. This is sent to Khoj server as a POST request.
       ;; find file content-type. Choose from org, markdown, pdf, plaintext
       (let ((content-type (khoj--filename-to-mime-type file-to-index))
             (file-name (encode-coding-string  file-to-index 'utf-8)))
-      (insert (format "--%s\r\n" boundary))
-      (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-name))
-      (insert (format "Content-Type: %s\r\n\r\n" content-type))
-      (insert (with-temp-buffer
-                (insert-file-contents-literally file-to-index)
-                (buffer-string)))
-      (insert "\r\n")))
+        (insert (format "--%s\r\n" boundary))
+        (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-name))
+        (insert (format "Content-Type: %s\r\n\r\n" content-type))
+        (insert (with-temp-buffer
+                  (insert-file-contents-literally file-to-index)
+                  (buffer-string)))
+        (insert "\r\n")))
     (insert (format "--%s--\r\n" boundary))
     (buffer-string)))
 
@@ -502,15 +482,14 @@ Use `BOUNDARY' to separate files. This is sent to Khoj server as a POST request.
   (with-temp-buffer
     (set-buffer-multibyte nil)
     (insert "\n")
-    (debug delete-files)
     (dolist (file-to-index delete-files)
       (let ((content-type (khoj--filename-to-mime-type file-to-index))
             (file-name (encode-coding-string  file-to-index 'utf-8)))
-          (insert (format "--%s\r\n" boundary))
-          (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-name))
-          (insert "Content-Type: %s\r\n\r\n" content-type)
-          (insert "")
-          (insert "\r\n")))
+        (insert (format "--%s\r\n" boundary))
+        (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-name))
+        (insert (format "Content-Type: %s\r\n\r\n" content-type))
+        (insert "")
+        (insert "\r\n")))
     (insert (format "--%s--\r\n" boundary))
     (buffer-string)))
 
@@ -523,7 +502,7 @@ Use `BOUNDARY' to separate files. This is sent to Khoj server as a POST request.
 
 ;; Cancel any running indexing timer, first
 (when khoj--index-timer
-    (cancel-timer khoj--index-timer))
+  (cancel-timer khoj--index-timer))
 ;; Send files to index on server every `khoj-index-interval' seconds
 (when khoj-auto-index
   (setq khoj--index-timer
@@ -694,15 +673,15 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
                  (equal content-type "org"))
              (progn (visual-line-mode)
                     (org-mode)
-                   (setq-local
-                    org-startup-folded "showall"
-                    org-hide-leading-stars t
-                    org-startup-with-inline-images t)
-                   (org-set-startup-visibility)))
+                    (setq-local
+                     org-startup-folded "showall"
+                     org-hide-leading-stars t
+                     org-startup-with-inline-images t)
+                    (org-set-startup-visibility)))
             ((equal content-type "markdown") (progn (markdown-mode)
                                                     (visual-line-mode)))
             ((equal content-type "image") (progn (shr-render-region (point-min) (point-max))
-                                                (goto-char (point-min))))
+                                                 (goto-char (point-min))))
             (t (fundamental-mode))))
     (read-only-mode t)))
 
@@ -715,7 +694,7 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
   "Chat with Khoj."
   (interactive)
   (when (not (get-buffer khoj--chat-buffer-name))
-      (khoj--load-chat-history khoj--chat-buffer-name))
+    (khoj--load-chat-history khoj--chat-buffer-name))
   (switch-to-buffer khoj--chat-buffer-name)
   (let ((query (read-string "Query: ")))
     (when (not (string-empty-p query))
@@ -809,8 +788,8 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
             (url-insert-file-contents query-url)
             (json-parse-buffer :object-type 'alist))
         ('file-error (cond ((string-match "Internal server error" (nth 2 ex))
-                      (message "Chat processor not configured. Configure OpenAI API key and restart it. Exception: [%s]" ex))
-                     (t (message "Chat exception: [%s]" ex))))))))
+                            (message "Chat processor not configured. Configure OpenAI API key and restart it. Exception: [%s]" ex))
+                           (t (message "Chat exception: [%s]" ex))))))))
 
 
 (defun khoj--get-chat-history-api ()
@@ -824,8 +803,8 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
             (url-insert-file-contents query-url)
             (json-parse-buffer :object-type 'alist))
         ('file-error (cond ((string-match "Internal server error" (nth 2 ex))
-                      (message "Chat processor not configured. Configure OpenAI API key and restart it. Exception: [%s]" ex))
-                     (t (message "Chat exception: [%s]" ex))))))))
+                            (message "Chat processor not configured. Configure OpenAI API key and restart it. Exception: [%s]" ex))
+                           (t (message "Chat exception: [%s]" ex))))))))
 
 
 (defun khoj--render-chat-message (message sender &optional receive-date)
@@ -908,15 +887,15 @@ RECEIVE-DATE is the message receive date."
            (not (equal query ""))
            (active-minibuffer-window)
            (equal (current-buffer) khoj--minibuffer-window))
-      (progn
-        (when rerank
-          (setq khoj--rerank t)
-          (message "khoj.el: Rerank Results"))
-        (khoj--query-search-api-and-render-results
-         query-url
-         khoj--content-type
-         query
-         khoj-buffer-name))))))
+        (progn
+          (when rerank
+            (setq khoj--rerank t)
+            (message "khoj.el: Rerank Results"))
+          (khoj--query-search-api-and-render-results
+           query-url
+           khoj--content-type
+           query
+           khoj-buffer-name))))))
 
 (defun khoj--delete-open-network-connections-to-server ()
   "Delete all network connections to khoj server."
@@ -956,9 +935,9 @@ RECEIVE-DATE is the message receive date."
           ;; set current (mini-)buffer entered as khoj minibuffer
           ;; used to query khoj API only when user in khoj minibuffer
           (setq khoj--minibuffer-window (current-buffer))
-          ; do khoj incremental search after idle time
+                                        ; do khoj incremental search after idle time
           (setq khoj--search-on-idle-timer (run-with-idle-timer khoj-search-on-idle-time t #'khoj--incremental-search))
-          ; teardown khoj incremental search on minibuffer exit
+                                        ; teardown khoj incremental search on minibuffer exit
           (add-hook 'minibuffer-exit-hook #'khoj--teardown-incremental-search))
       (read-string khoj--query-prompt))))
 
@@ -1104,8 +1083,8 @@ Paragraph only starts at first text after blank line."
 (defun khoj ()
   "Search and chat with your knowledge base using your personal AI copilot.
 
-Collaborate with Khoj to search, understand, create, review and update your knowledge base.
-Khoj can research across your org-mode, markdown notes, plaintext documents and the internet."
+Collaborate with Khoj to search, create, review and update your knowledge base.
+Research across the internet & your documents from the comfort of Emacs."
   (interactive)
   (when khoj-auto-setup
     (khoj-setup t))
